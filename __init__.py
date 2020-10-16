@@ -1,22 +1,106 @@
+import html
 import os
 import re
 import traceback
+import urllib
 from concurrent.futures import Future
 
 import anki.importing as importing
+import requests
+from anki.httpclient import HttpClient
 from anki.importing.csvfile import TextImporter
 from anki.lang import _
 from aqt import mw
+from aqt.editor import pics
 from aqt.importing import ImportDialog, showUnicodeWarning
 from aqt.qt import *
 from aqt.utils import TR, getFile, showInfo, showText, showWarning, tr
 
 
+# fnameToLink and _retrieveURL are taken from aqt/editor.py with modifications
+def fnameToLink(fname):
+    ext = fname.split(".")[-1].lower()
+    if ext in pics:
+        # name = urllib.parse.quote(fname.encode("utf8"))
+        return (
+            '<img src=""%s"">' % fname
+        )  # double quotes because imported fields are wrapped in quotes
+    else:
+        return "[sound:%s]" % html.escape(fname, quote=False)
+
+
+def _retrieveURL(url: str):
+    # url = urllib.parse.unquote(url)
+    url = html.unescape(url)
+    if url.lower().startswith("file://"):
+        url = url.replace("%", "%25")
+        url = url.replace("#", "%23")
+        local = True
+    else:
+        local = False
+    # fetch it into a temporary folder
+    mw.progress.start(immediate=not local)
+    content_type = None
+    error_msg = None
+    try:
+        if local:
+            req = urllib.request.Request(
+                url, None, {"User-Agent": "Mozilla/5.0 (compatible; Anki)"}
+            )
+            with urllib.request.urlopen(req) as response:
+                filecontents = response.read()
+        else:
+            with HttpClient() as client:
+                client.timeout = 30
+                # print(f"_retrieveURL(): url = '{url}'")
+                with client.get(url) as response:
+                    # print(f"_retrieveURL(): response.status_code = '{response.status_code}'")
+                    if response.status_code != 200:
+                        error_msg = (
+                            _("Unexpected response code: %s") % response.status_code
+                        )
+                        return None
+                    filecontents = response.content
+                    content_type = response.headers.get("content-type")
+    except (urllib.error.URLError, requests.exceptions.RequestException) as e:
+        error_msg = _("An error occurred while opening %s") % e
+        return None
+    finally:
+        mw.progress.finish()
+        if error_msg:
+            showWarning(error_msg)
+    # strip off any query string
+    fname = os.path.basename(urllib.parse.unquote(url))
+    if not fname.strip():
+        fname = "paste"
+    if content_type:
+        fname = mw.col.media.add_extension_based_on_mime(fname, content_type)
+
+    return mw.col.media.write_data(fname, filecontents)
+
+
 def transform_file(filename):
+    def process_field(name, content):
+        if name == "رابط تحميل الصورة":
+            content = content.strip()
+            try:
+                fname = _retrieveURL(content)
+                # print(f"fname = {fname}")
+                if fname:
+                    return fnameToLink(fname)
+                else:
+                    return content
+            except Exception as e:
+                # print(e)
+                return content
+        else:
+            return content
 
     fields = [
         "العنوان",
         "النص",
+        "اسم الصورة",
+        "رابط تحميل الصورة",
         "التخصص",
         "العلم",
         "المؤلف",
@@ -24,10 +108,10 @@ def transform_file(filename):
         "الطبعة",
         "الصفحة",
         "الباب",
+        "تعليق",
         "تاريخ الإضافة الهجري",
         "تاريخ الإضافة الميلادي",
     ]
-    cur_fld = 0
 
     newfile_path = os.path.join(
         os.path.abspath(os.path.dirname(__file__)), "__tmp__.txt"
@@ -37,8 +121,11 @@ def transform_file(filename):
         lines = file.readlines()
         card = ""
         field = ""
+        cur_fld = 0
+        cur_src_fld_name = ""
         for ln, line in enumerate(lines):
             line = line.replace("\u200F", "").replace('"', '""')
+            line = html.escape(line, quote=False)
 
             match = re.match("([^:]*)(:)?(.*)", line)
             delim = match[2]
@@ -51,7 +138,7 @@ def transform_file(filename):
 
                     # last field of card
                     if card:
-                        card += f'"{field}"\t'
+                        card += f'"{process_field(cur_src_fld_name, field)}"\t'
                     # if card has a number of fields less than the number of dawwen fields,
                     # make sure to take account of the missing fields anyway,
                     # so that we get the right mapping automatically
@@ -72,11 +159,12 @@ def transform_file(filename):
                     n = int(src_fld_name[idx:])
                     card = f'"{str(n)}"\t'
                     field = ""
+                    cur_src_fld_name = src_fld_name
                 elif src_fld_name in fields:
                     # got a new field
                     # write previous field first
                     if field:
-                        card += f'"{field}"\t'
+                        card += f'"{process_field(cur_src_fld_name, field)}"\t'
 
                     # write missing fields in file
                     while cur_fld < fields.index(src_fld_name):
@@ -87,13 +175,14 @@ def transform_file(filename):
                     # write first line of new field content
                     field = f"{src_fld_content}\n"
 
+                    cur_src_fld_name = src_fld_name
                 else:
                     field += f"{line}\n"
             else:
                 field += f"{line}\n"
         # ensure last card gets written
         if card:
-            card += f'"{field}"\t'
+            card += f'"{process_field(cur_src_fld_name, field)}"\t'
             card = card[:-1] + "\n"
             outfile.write(card)
         outfile.close()
@@ -110,7 +199,7 @@ def auto_import(importer, model, deck):
 
     importer.initMapping()
     importer.importMode = 0  # update mode
-    importer.allowHTML = False
+    importer.allowHTML = True
     mw.col.models.save(importer.model, updateReqs=False)
 
     mw.progress.start()
@@ -213,6 +302,7 @@ def make_model():
 <div class="alert back">
 {{النص}}
 </div>
+{{الصورة}}
 {{#Extra}}
 <div class="alert extra">
 {{Extra}}
@@ -293,6 +383,8 @@ background: #cce5ff;
         "رقم التدوينة",
         "العنوان",
         "النص",
+        "اسم الصورة",
+        "الصورة",
         "التخصص",
         "العلم",
         "المؤلف",
@@ -300,6 +392,7 @@ background: #cce5ff;
         "الطبعة",
         "الصفحة",
         "الباب",
+        "التعليق",
         "تاريخ الإضافة الهجري",
         "تاريخ الإضافة الميلادي",
     ]
