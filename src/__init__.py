@@ -303,11 +303,11 @@ def make_model():
 {{النص}}
 </div>
 {{الصورة}}
-{{#Extra}}
+{{#التعليق}}
 <div class="alert extra">
-{{Extra}}
+{{التعليق}}
 </div>
-{{/Extra}}"""
+{{/التعليق}}"""
 
     css = """.card {
     font-family: MyFont, sans-serif;
